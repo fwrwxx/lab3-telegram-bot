@@ -6,37 +6,64 @@
 """
 
 import os
+import sys
 import logging
-from dotenv import load_dotenv
 import asyncio
-
-from aiohttp import web
 import threading
+from dotenv import load_dotenv
 
-from google import genai
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
-
-# ---------- Завантаження .env ----------
+# ---------- Завантаження .env (локально) ----------
 load_dotenv()
 
+# ---------- Логування (якнайраніше) ----------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+    stream=sys.stdout,
+)
+logger = logging.getLogger(__name__)
+
+logger.info("=== START bot.py ===")
+
+# ---------- Імпорти сторонніх бібліотек ----------
+try:
+    from google import genai
+    from telegram import Update, ReplyKeyboardMarkup
+    from telegram.ext import (
+        Application,
+        CommandHandler,
+        MessageHandler,
+        ContextTypes,
+        filters,
+    )
+    from aiohttp import web
+    logger.info("Усі бібліотеки імпортовано успішно")
+except Exception as e:
+    logger.exception(f"Помилка імпорту бібліотек: {e}")
+    sys.exit(1)
+
+# ---------- Читання змінних оточення ----------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not TELEGRAM_TOKEN:
-    raise SystemExit("❌ TELEGRAM_TOKEN не задано у .env")
-if not GEMINI_API_KEY:
-    raise SystemExit("❌ GEMINI_API_KEY не задано у .env")
+logger.info(f"TELEGRAM_TOKEN: {'OK' if TELEGRAM_TOKEN else 'НЕ ЗНАЙДЕНО'}")
+logger.info(f"GEMINI_API_KEY: {'OK' if GEMINI_API_KEY else 'НЕ ЗНАЙДЕНО'}")
 
-# ---------- Ініціалізація Gemini (новий SDK) ----------
-client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-3.5-flash-lite"
+if not TELEGRAM_TOKEN:
+    logger.error("❌ TELEGRAM_TOKEN не задано")
+    sys.exit(1)
+if not GEMINI_API_KEY:
+    logger.error("❌ GEMINI_API_KEY не задано")
+    sys.exit(1)
+
+# ---------- Ініціалізація Gemini ----------
+try:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    MODEL_NAME = "gemini-3.5-flash-lite"
+    logger.info(f"Gemini ініціалізовано, модель: {MODEL_NAME}")
+except Exception as e:
+    logger.exception(f"Помилка ініціалізації Gemini: {e}")
+    sys.exit(1)
 
 # ---------- Дані варіанта 5 ----------
 VARIANT_DATA = {
@@ -55,13 +82,6 @@ VARIANT_DATA = {
     ),
 }
 
-# ---------- Логування ----------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
 # ---------- Клавіатури ----------
 MAIN_MENU = ReplyKeyboardMarkup(
     [
@@ -75,7 +95,42 @@ MAIN_MENU = ReplyKeyboardMarkup(
 BACK_BUTTON = ReplyKeyboardMarkup([["⬅️ Назад"]], resize_keyboard=True)
 
 
-# ---------- Хендлери ----------
+# ---------- Health-check сервер (для Render uptime) ----------
+async def health_handler(request):
+    return web.Response(text="OK")
+
+
+async def run_health_server():
+    try:
+        app_web = web.Application()
+        app_web.router.add_get("/", health_handler)
+        app_web.router.add_get("/health", health_handler)
+        runner = web.AppRunner(app_web)
+        await runner.setup()
+        port = int(os.getenv("PORT", 10000))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"Health-check сервер запущено на порту {port}")
+    except Exception as e:
+        logger.exception(f"Помилка health-check сервера: {e}")
+
+
+def start_health_thread():
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_health_server())
+            loop.run_forever()
+        except Exception as e:
+            logger.exception(f"Health thread error: {e}")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    logger.info("Health-check потік запущено")
+
+
+# ---------- Хендлери Telegram ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Вас вітає чат-бот! Виберіть відповідну команду",
@@ -142,6 +197,7 @@ async def ask_ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 logger.warning(f"Спроба {attempt} (503), чекаємо {delay}с...")
                 await asyncio.sleep(delay)
             else:
+                logger.exception("AI error")
                 answer = f"⚠️ Помилка AI: {e}"
                 break
 
@@ -160,35 +216,25 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def health_handler(request):
-    return web.Response(text="OK")
-
-async def run_health_server():
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    app.router.add_get("/health", health_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
-    await site.start()
-    logger.info("Health-check сервер запущено")
-
-
 # ---------- Точка входу ----------
 def main() -> None:
-    # Запуск health-check сервера в окремому потоці
-    def start_health():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_health_server())
-        loop.run_forever()
+    logger.info("Запуск health-check сервера...")
+    start_health_thread()
 
-    threading.Thread(target=start_health, daemon=True).start()
-
+    logger.info("Ініціалізація Telegram Application...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     logger.info("Бот запущено. Натисніть Ctrl+C для зупинки.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception(f"FATAL: {e}")
+        sys.exit(1)
