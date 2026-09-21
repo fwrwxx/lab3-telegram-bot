@@ -10,6 +10,9 @@ import logging
 from dotenv import load_dotenv
 import asyncio
 
+from aiohttp import web
+import threading
+
 from google import genai
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
@@ -157,17 +160,35 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def health_handler(request):
+    return web.Response(text="OK")
+
+async def run_health_server():
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 10000)))
+    await site.start()
+    logger.info("Health-check сервер запущено")
+
+
 # ---------- Точка входу ----------
 def main() -> None:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    # Запуск health-check сервера в окремому потоці
+    def start_health():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_health_server())
+        loop.run_forever()
 
+    threading.Thread(target=start_health, daemon=True).start()
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
 
     logger.info("Бот запущено. Натисніть Ctrl+C для зупинки.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
